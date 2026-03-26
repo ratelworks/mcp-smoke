@@ -2,16 +2,12 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/ratelworks/mcp-smoke/internal/smoke"
-)
-
-const (
-	commandName = "mcp-smoke"
 )
 
 func main() {
@@ -25,26 +21,88 @@ func run(args []string) int {
 	var skipEnv bool
 	var skipPath bool
 
-	flagSet := flag.NewFlagSet(commandName, flag.ContinueOnError)
-	flagSet.SetOutput(io.Discard)
-	flagSet.StringVar(&configPath, "config", "", "Path to an MCP client config file.")
-	flagSet.BoolVar(&jsonOutput, "json", false, "Render the report as JSON.")
-	flagSet.BoolVar(&skipCwd, "skip-cwd", false, "Skip checks for cwd entries.")
-	flagSet.BoolVar(&skipEnv, "skip-env", false, "Skip checks for env entries.")
-	flagSet.BoolVar(&skipPath, "skip-path", false, "Skip command and script path checks.")
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				if _, err := os.Stderr.WriteString("unexpected argument: " + args[i+1] + "\n"); err != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			break
+		}
 
-	if err := flagSet.Parse(args); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		return smoke.ExitCodeUserError
-	}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			if _, err := os.Stderr.WriteString("unexpected argument: " + arg + "\n"); err != nil {
+				return smoke.ExitCodeSystemError
+			}
+			return smoke.ExitCodeUserError
+		}
 
-	if tail := flagSet.Args(); len(tail) > 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument: %s\n", tail[0])
-		return smoke.ExitCodeUserError
+		key, value, hasValue := strings.Cut(arg, "=")
+		switch key {
+		case "-config", "--config":
+			if hasValue {
+				configPath = value
+				continue
+			}
+			if i+1 >= len(args) {
+				if _, err := os.Stderr.WriteString("flag needs an argument: -config\n"); err != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			i++
+			configPath = args[i]
+		case "-json", "--json":
+			valueBool, err := parseBoolFlag(hasValue, value)
+			if err != nil {
+				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			jsonOutput = valueBool
+		case "-skip-cwd", "--skip-cwd":
+			valueBool, err := parseBoolFlag(hasValue, value)
+			if err != nil {
+				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			skipCwd = valueBool
+		case "-skip-env", "--skip-env":
+			valueBool, err := parseBoolFlag(hasValue, value)
+			if err != nil {
+				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			skipEnv = valueBool
+		case "-skip-path", "--skip-path":
+			valueBool, err := parseBoolFlag(hasValue, value)
+			if err != nil {
+				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			skipPath = valueBool
+		default:
+			if _, err := os.Stderr.WriteString("flag provided but not defined: " + arg + "\n"); err != nil {
+				return smoke.ExitCodeSystemError
+			}
+			return smoke.ExitCodeUserError
+		}
 	}
 
 	if configPath == "" {
-		fmt.Fprintln(os.Stderr, "config path is required")
+		if _, err := os.Stderr.WriteString("config path is required\n"); err != nil {
+			return smoke.ExitCodeSystemError
+		}
 		return smoke.ExitCodeUserError
 	}
 
@@ -54,7 +112,9 @@ func run(args []string) int {
 		SkipPath: skipPath,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+			return smoke.ExitCodeSystemError
+		}
 
 		var appErr *smoke.AppError
 		if errors.As(err, &appErr) {
@@ -74,12 +134,16 @@ func run(args []string) int {
 		output = smoke.FormatTextReport(report)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+			return smoke.ExitCodeSystemError
+		}
 		return smoke.ExitCodeSystemError
 	}
 
-	if _, err := io.WriteString(os.Stdout, output); err != nil {
-		fmt.Fprintf(os.Stderr, "write report failed: %v\n", err)
+	if _, err := os.Stdout.WriteString(output); err != nil {
+		if _, writeErr := os.Stderr.WriteString("write report failed: " + err.Error() + "\n"); writeErr != nil {
+			return smoke.ExitCodeSystemError
+		}
 		return smoke.ExitCodeSystemError
 	}
 
@@ -89,4 +153,16 @@ func run(args []string) int {
 	}
 
 	return smoke.ExitCodeSuccess
+}
+
+func parseBoolFlag(hasValue bool, value string) (bool, error) {
+	if !hasValue {
+		return true, nil
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid boolean value %q", value)
+	}
+	return parsed, nil
 }

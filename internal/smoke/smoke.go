@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -144,7 +145,7 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	}
 
 	baseDir := filepath.Dir(configPath)
-	var findings []Finding
+	findings := make([]Finding, 0, len(servers))
 	for _, server := range servers {
 		findings = append(findings, analyzeServer(baseDir, server, options)...)
 	}
@@ -167,7 +168,7 @@ func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
 		return Report{}, false
 	}
 
-	var findings []Finding
+	findings := make([]Finding, 0, len(root.MCPServers))
 	for name, spec := range root.MCPServers {
 		findings = append(findings, analyzeQuickServer(name, spec)...)
 	}
@@ -215,7 +216,7 @@ func analyzeQuickServer(serverName string, spec quickServerSpec) []Finding {
 }
 
 func validateRemoteServerQuick(serverName string, spec quickServerSpec) []Finding {
-	var findings []Finding
+	findings := make([]Finding, 0, 2)
 	if serverName == "" {
 		serverName = defaultServerLabel
 	}
@@ -254,12 +255,17 @@ func validateRemoteServerQuick(serverName string, spec quickServerSpec) []Findin
 // FormatTextReport renders a human-readable report.
 func FormatTextReport(report Report) string {
 	var builder strings.Builder
+	builder.Grow(64 + len(report.ConfigPath) + len(report.ConfigKind) + len(report.Findings)*96)
 	builder.WriteString("mcp-smoke report\n")
-	builder.WriteString(fmt.Sprintf("config: %s\n", report.ConfigPath))
-	builder.WriteString(fmt.Sprintf("format: %s\n", report.ConfigKind))
-	builder.WriteString(fmt.Sprintf("servers: %d\n", report.ServerCount))
-	builder.WriteString(fmt.Sprintf("findings: %d\n", len(report.Findings)))
-	builder.WriteString("\n")
+	builder.WriteString("config: ")
+	builder.WriteString(report.ConfigPath)
+	builder.WriteString("\nformat: ")
+	builder.WriteString(report.ConfigKind)
+	builder.WriteString("\nservers: ")
+	builder.WriteString(strconv.Itoa(report.ServerCount))
+	builder.WriteString("\nfindings: ")
+	builder.WriteString(strconv.Itoa(len(report.Findings)))
+	builder.WriteString("\n\n")
 
 	if len(report.Findings) == 0 {
 		builder.WriteString("No blocking issues found.\n")
@@ -267,9 +273,16 @@ func FormatTextReport(report Report) string {
 	}
 
 	for index, finding := range report.Findings {
-		builder.WriteString(fmt.Sprintf("%d. [%s] %s\n", index+1, finding.Severity, finding.Server))
-		builder.WriteString(fmt.Sprintf("   problem: %s\n", finding.Problem))
-		builder.WriteString(fmt.Sprintf("   fix: %s\n", finding.Fix))
+		builder.WriteString(strconv.Itoa(index + 1))
+		builder.WriteString(". [")
+		builder.WriteString(finding.Severity)
+		builder.WriteString("] ")
+		builder.WriteString(finding.Server)
+		builder.WriteString("\n   problem: ")
+		builder.WriteString(finding.Problem)
+		builder.WriteString("\n   fix: ")
+		builder.WriteString(finding.Fix)
+		builder.WriteString("\n")
 		if index < len(report.Findings)-1 {
 			builder.WriteString("\n")
 		}
@@ -383,7 +396,7 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		return validateRemoteServer(spec)
 	}
 
-	var findings []Finding
+	findings := make([]Finding, 0, 4)
 	serverName := spec.Name
 	if serverName == "" {
 		serverName = defaultServerLabel
@@ -455,7 +468,7 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 }
 
 func validateRemoteServer(spec serverSpec) []Finding {
-	var findings []Finding
+	findings := make([]Finding, 0, 2)
 	serverName := spec.Name
 	if serverName == "" {
 		serverName = defaultServerLabel
