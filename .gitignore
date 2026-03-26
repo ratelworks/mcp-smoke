@@ -22,3 +22,4 @@ ar.json
 run.log
 program.md
 eval.sh
+.gocache/
