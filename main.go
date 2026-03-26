@@ -20,6 +20,7 @@ func run(args []string) int {
 	var skipCwd bool
 	var skipEnv bool
 	var skipPath bool
+	var liveMode bool
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -91,6 +92,15 @@ func run(args []string) int {
 				return smoke.ExitCodeUserError
 			}
 			skipPath = valueBool
+		case "-live", "--live":
+			valueBool, err := parseBoolFlag(hasValue, value)
+			if err != nil {
+				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
+					return smoke.ExitCodeSystemError
+				}
+				return smoke.ExitCodeUserError
+			}
+			liveMode = valueBool
 		default:
 			if _, err := os.Stderr.WriteString("flag provided but not defined: " + arg + "\n"); err != nil {
 				return smoke.ExitCodeSystemError
@@ -110,6 +120,7 @@ func run(args []string) int {
 		SkipCwd:  skipCwd,
 		SkipEnv:  skipEnv,
 		SkipPath: skipPath,
+		Live:     liveMode,
 	})
 	if err != nil {
 		if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {

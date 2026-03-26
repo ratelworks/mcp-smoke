@@ -122,9 +122,12 @@ type configProbe struct {
 }
 
 type quickServerProbe struct {
-	CommandPresent bool
-	Transport      string
-	URL            string
+	Command   string
+	ArgsFirst string
+	ArgsPresent bool
+	Cwd       string
+	Transport string
+	URL       string
 }
 
 type analysisCacheKey struct {
@@ -181,15 +184,13 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	}
 
 	var report Report
-	if options.SkipCwd && options.SkipPath {
-		if fastReport, ok := analyzeFastDesktop(configPath, content); ok {
-			analysisCacheMu.Lock()
-			cachedAnalysisKey = cacheKey
-			cachedAnalysisEntry = analysisCacheEntry{Report: fastReport}
-			cachedAnalysisValid = true
-			analysisCacheMu.Unlock()
-			return fastReport, nil
-		}
+	if fastReport, ok := analyzeFastDesktop(configPath, content, options); ok {
+		analysisCacheMu.Lock()
+		cachedAnalysisKey = cacheKey
+		cachedAnalysisEntry = analysisCacheEntry{Report: fastReport}
+		cachedAnalysisValid = true
+		analysisCacheMu.Unlock()
+		return fastReport, nil
 	}
 
 	configKind, servers, err := parseServers(content)
@@ -212,6 +213,13 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		findings = append(findings, analyzeServer(baseDir, server, options)...)
 	}
 
+	// Live smoke test: start each stdio server and verify MCP handshake
+	if options.Live {
+		for _, server := range servers {
+			findings = append(findings, LiveCheck(server, baseDir)...)
+		}
+	}
+
 	if len(findings) > 1 {
 		sortFindings(findings)
 	}
@@ -230,8 +238,9 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	return report, nil
 }
 
-func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
-	serverCount, findings, ok := parseFastDesktop(content)
+func analyzeFastDesktop(configPath string, content []byte, options Options) (Report, bool) {
+	baseDir := filepath.Dir(configPath)
+	serverCount, findings, ok := parseFastDesktop(baseDir, content, options)
 	if !ok {
 		return Report{}, false
 	}
@@ -248,7 +257,7 @@ func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
 	}, true
 }
 
-func parseFastDesktop(content []byte) (int, []Finding, bool) {
+func parseFastDesktop(baseDir string, content []byte, options Options) (int, []Finding, bool) {
 	i := skipSpaces(content, 0)
 	if i >= len(content) || content[i] != '{' {
 		return 0, nil, false
@@ -285,7 +294,7 @@ func parseFastDesktop(content []byte) (int, []Finding, bool) {
 			if i >= len(content) || content[i] != '{' {
 				return 0, nil, false
 			}
-			serverCount, findings, i, ok = parseFastDesktopServers(content, i, findings)
+			serverCount, findings, i, ok = parseFastDesktopServers(baseDir, content, i, findings, options)
 			if !ok {
 				return 0, nil, false
 			}
@@ -315,7 +324,7 @@ func parseFastDesktop(content []byte) (int, []Finding, bool) {
 	}
 }
 
-func parseFastDesktopServers(content []byte, i int, findings []Finding) (int, []Finding, int, bool) {
+func parseFastDesktopServers(baseDir string, content []byte, i int, findings []Finding, options Options) (int, []Finding, int, bool) {
 	if content[i] != '{' {
 		return 0, nil, 0, false
 	}
@@ -349,7 +358,7 @@ func parseFastDesktopServers(content []byte, i int, findings []Finding) (int, []
 		if !ok {
 			return 0, nil, 0, false
 		}
-		findings = append(findings, analyzeFastServer(content[nameStart:nameEnd], nameEscaped, spec)...)
+		findings = append(findings, analyzeFastServer(baseDir, content[nameStart:nameEnd], nameEscaped, spec, options)...)
 
 		i = skipSpaces(content, next)
 		if i >= len(content) {
@@ -394,11 +403,26 @@ func parseFastServer(content []byte, i int) (quickServerProbe, int, bool) {
 
 		switch {
 		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "command"):
-			valueStart, valueEnd, next, _, ok := scanJSONString(content, i)
+			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
 			if !ok {
 				return spec, 0, false
 			}
-			spec.CommandPresent = valueEnd > valueStart
+			spec.Command = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			i = next
+		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "args"):
+			firstArg, hasArgs, next, ok := parseFastArgs(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+			spec.ArgsFirst = firstArg
+			spec.ArgsPresent = hasArgs
+			i = next
+		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "cwd"):
+			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+			spec.Cwd = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
 			i = next
 		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "transport"):
 			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
@@ -436,30 +460,116 @@ func parseFastServer(content []byte, i int) (quickServerProbe, int, bool) {
 	}
 }
 
-func analyzeFastServer(serverName []byte, serverNameEscaped bool, spec quickServerProbe) []Finding {
+func parseFastArgs(content []byte, i int) (string, bool, int, bool) {
+	if content[i] != '[' {
+		return "", false, 0, false
+	}
+	i++
+
+	firstArg := ""
+	hasArgs := false
+	for {
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return "", false, 0, false
+		}
+		if content[i] == ']' {
+			return firstArg, hasArgs, i + 1, true
+		}
+
+		valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
+		if !ok {
+			return "", false, 0, false
+		}
+		if !hasArgs {
+			firstArg = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			hasArgs = true
+		}
+		i = skipSpaces(content, next)
+		if i >= len(content) {
+			return "", false, 0, false
+		}
+		if content[i] == ',' {
+			i++
+			continue
+		}
+		if content[i] == ']' {
+			return firstArg, hasArgs, i + 1, true
+		}
+		return "", false, 0, false
+	}
+}
+
+func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool, spec quickServerProbe, options Options) []Finding {
 	if spec.URL != "" {
 		return validateRemoteServerQuick(serverName, serverNameEscaped, spec)
 	}
 
-	if !spec.CommandPresent {
+	findings := make([]Finding, 0, 4)
+	serverNameValue := serverNameText(serverName, serverNameEscaped)
+
+	if spec.Command == "" {
 		return []Finding{{
-			Server:   serverNameText(serverName, serverNameEscaped),
+			Server:   serverNameValue,
 			Severity: SeverityError,
 			Problem:  "missing command for local MCP server",
 			Fix:      "Set the command field to an executable that can launch the server.",
 		}}
 	}
 
+	if !options.SkipPath {
+		if _, err := exec.LookPath(spec.Command); err != nil {
+			findings = append(findings, Finding{
+				Server:   serverNameValue,
+				Severity: SeverityError,
+				Problem:  fmt.Sprintf("command not found: %s", spec.Command),
+				Fix:      "Install the command or update the config to use a valid executable name.",
+			})
+		}
+	}
+
+	if !options.SkipCwd && spec.Cwd != "" {
+		cwdPath := resolvePath(baseDir, spec.Cwd)
+		info, err := os.Stat(cwdPath)
+		if err != nil {
+			findings = append(findings, Finding{
+				Server:   serverNameValue,
+				Severity: SeverityError,
+				Problem:  fmt.Sprintf("cwd does not exist: %s", cwdPath),
+				Fix:      "Create the directory or point cwd at an existing workspace.",
+			})
+		} else if !info.IsDir() {
+			findings = append(findings, Finding{
+				Server:   serverNameValue,
+				Severity: SeverityError,
+				Problem:  fmt.Sprintf("cwd is not a directory: %s", cwdPath),
+				Fix:      "Change cwd to a directory path.",
+			})
+		}
+	}
+
 	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
-		return []Finding{{
-			Server:   serverNameText(serverName, serverNameEscaped),
+		findings = append(findings, Finding{
+			Server:   serverNameValue,
 			Severity: SeverityWarning,
 			Problem:  fmt.Sprintf("local server uses non-stdio transport: %s", spec.Transport),
 			Fix:      "Use stdio for local MCP servers or move the server behind a supported remote endpoint.",
-		}}
+		})
 	}
 
-	return nil
+	if !options.SkipPath && spec.ArgsPresent && shouldCheckScriptPath(spec.Command, []string{spec.ArgsFirst}) {
+		scriptPath := resolveScriptPath(baseDir, spec.Cwd, spec.ArgsFirst)
+		if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+			findings = append(findings, Finding{
+				Server:   serverNameValue,
+				Severity: SeverityError,
+				Problem:  fmt.Sprintf("script file not found: %s", scriptPath),
+				Fix:      "Create the script file or update the first argument to an existing path.",
+			})
+		}
+	}
+
+	return findings
 }
 
 func validateRemoteServerQuick(serverName []byte, serverNameEscaped bool, spec quickServerProbe) []Finding {
@@ -474,18 +584,19 @@ func validateRemoteServerQuick(serverName []byte, serverNameEscaped bool, spec q
 	}
 
 	findings := make([]Finding, 0, 2)
+	serverNameValue := serverNameText(serverName, serverNameEscaped)
 	if strings.EqualFold(parsedURL.Scheme, "http") && !isLocalHost(parsedURL.Hostname()) {
 		findings = append(findings, Finding{
-			Server:   serverNameText(serverName, serverNameEscaped),
+			Server:   serverNameValue,
 			Severity: SeverityWarning,
 			Problem:  fmt.Sprintf("remote endpoint uses plain HTTP: %s", spec.URL),
 			Fix:      "Switch the endpoint to HTTPS unless it is local development.",
 		})
 	}
 
-	if spec.CommandPresent {
+	if spec.Command != "" {
 		findings = append(findings, Finding{
-			Server:   serverNameText(serverName, serverNameEscaped),
+			Server:   serverNameValue,
 			Severity: SeverityWarning,
 			Problem:  "remote server should not set a local command",
 			Fix:      "Remove the command field from the remote server definition.",
@@ -505,9 +616,9 @@ func FormatTextReport(report Report) string {
 	builder.WriteString("\nformat: ")
 	builder.WriteString(report.ConfigKind)
 	builder.WriteString("\nservers: ")
-	builder.WriteString(strconv.Itoa(report.ServerCount))
+	writeInt(&builder, report.ServerCount)
 	builder.WriteString("\nfindings: ")
-	builder.WriteString(strconv.Itoa(len(report.Findings)))
+	writeInt(&builder, len(report.Findings))
 	builder.WriteString("\n\n")
 
 	if len(report.Findings) == 0 {
@@ -516,7 +627,7 @@ func FormatTextReport(report Report) string {
 	}
 
 	for index, finding := range report.Findings {
-		builder.WriteString(strconv.Itoa(index + 1))
+		writeInt(&builder, index+1)
 		builder.WriteString(". [")
 		builder.WriteString(finding.Severity)
 		builder.WriteString("] ")
@@ -532,6 +643,11 @@ func FormatTextReport(report Report) string {
 	}
 
 	return builder.String()
+}
+
+func writeInt(builder *strings.Builder, value int) {
+	var buf [20]byte
+	builder.Write(strconv.AppendInt(buf[:0], int64(value), 10))
 }
 
 // FormatJSONReport renders the report as indented JSON.

@@ -152,7 +152,8 @@ actionable report
 - The CLI reads one config file and supports three shapes: `mcpServers`, `servers`, and a single server object.
 - It checks local command availability, working directories, scripts, and empty environment variables.
 - It warns on risky remote endpoints such as plain HTTP.
-- It never launches a server or mutates your config.
+- By default it never launches a server or mutates your config.
+- With `--live`, it starts each stdio server, sends `initialize` and `tools/list`, and reports protocol failures.
 
 ## Feature Reference
 
@@ -161,6 +162,7 @@ actionable report
 | Config format detection | Reads supported MCP config shapes and normalizes them into one report. |
 | Local server checks | Verifies commands, working directories, env values, and script paths. |
 | Remote endpoint checks | Flags invalid URLs and plain HTTP remote endpoints. |
+| Live smoke test | Starts each stdio MCP server, sends `initialize` and `tools/list`, reports timeout or protocol errors. Enabled with `--live`. |
 | JSON output | Returns machine-readable output for CI or automation. |
 
 ### Config Format Detection
@@ -193,6 +195,7 @@ How to disable: Omit `--json` to use the text report.
 | `--skip-cwd` | flag | Skip working directory checks. |
 | `--skip-env` | flag | Skip environment variable checks. |
 | `--skip-path` | flag | Skip command and script path checks. |
+| `--live` | flag | Start each stdio server and verify MCP handshake (initialize + tools/list). |
 
 ### Exit Codes
 
