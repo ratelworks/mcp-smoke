@@ -148,7 +148,9 @@ func run(args []string) int {
 	}
 
 	if len(report.Findings) > 0 {
-		fmt.Fprintf(os.Stderr, "smoke check failed with %d finding(s)\n", len(report.Findings))
+		if _, err := os.Stderr.WriteString("smoke check failed with " + strconv.Itoa(len(report.Findings)) + " finding(s)\n"); err != nil {
+			return smoke.ExitCodeSystemError
+		}
 		return smoke.ExitCodeUserError
 	}
 

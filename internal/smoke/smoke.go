@@ -76,6 +76,7 @@ type Options struct {
 	SkipCwd  bool
 	SkipEnv  bool
 	SkipPath bool
+	Live     bool // Start stdio servers and test initialize + tools/list
 }
 
 // Finding describes one actionable issue discovered during analysis.
@@ -104,11 +105,20 @@ type serverSpec struct {
 	URL       string            `json:"url"`
 }
 
+type parsedServerSpec struct {
+	Name      string   `json:"name"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	Cwd       string   `json:"cwd"`
+	Transport string   `json:"transport"`
+	URL       string   `json:"url"`
+}
+
 type configProbe struct {
-	MCPServers map[string]serverSpec `json:"mcpServers"`
-	Servers    []serverSpec          `json:"servers"`
-	Command    json.RawMessage       `json:"command"`
-	URL        json.RawMessage       `json:"url"`
+	MCPServers map[string]parsedServerSpec `json:"mcpServers"`
+	Servers    []parsedServerSpec          `json:"servers"`
+	Command    json.RawMessage             `json:"command"`
+	URL        json.RawMessage             `json:"url"`
 }
 
 type quickServerProbe struct {
@@ -122,7 +132,6 @@ type analysisCacheKey struct {
 	Size       int64
 	ModTime    int64
 	SkipCwd    bool
-	SkipEnv    bool
 	SkipPath   bool
 }
 
@@ -153,7 +162,6 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		Size:       info.Size(),
 		ModTime:    info.ModTime().UnixNano(),
 		SkipCwd:    options.SkipCwd,
-		SkipEnv:    options.SkipEnv,
 		SkipPath:   options.SkipPath,
 	}
 	analysisCacheMu.RLock()
@@ -173,7 +181,7 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	}
 
 	var report Report
-	if options.SkipCwd && options.SkipEnv && options.SkipPath {
+	if options.SkipCwd && options.SkipPath {
 		if fastReport, ok := analyzeFastDesktop(configPath, content); ok {
 			analysisCacheMu.Lock()
 			cachedAnalysisKey = cacheKey
@@ -564,11 +572,17 @@ func parseServers(content []byte) (string, []serverSpec, error) {
 	return "", nil, fmt.Errorf("unsupported config format: expected %q, %q, or a single server object", KindDesktopConfig, KindServerList)
 }
 
-func normalizeDesktopServers(servers map[string]serverSpec) (string, []serverSpec, error) {
+func normalizeDesktopServers(servers map[string]parsedServerSpec) (string, []serverSpec, error) {
 	normalized := make([]serverSpec, 0, len(servers))
 	for name, spec := range servers {
-		spec.Name = name
-		normalized = append(normalized, spec)
+		normalized = append(normalized, serverSpec{
+			Name:      name,
+			Command:   spec.Command,
+			Args:      spec.Args,
+			Cwd:       spec.Cwd,
+			Transport: spec.Transport,
+			URL:       spec.URL,
+		})
 	}
 
 	return KindDesktopConfig, normalized, nil
@@ -576,7 +590,7 @@ func normalizeDesktopServers(servers map[string]serverSpec) (string, []serverSpe
 
 func parseServerList(raw json.RawMessage) (string, []serverSpec, error) {
 	if firstNonSpace(raw) == '[' {
-		var servers []serverSpec
+		var servers []parsedServerSpec
 		if err := json.Unmarshal(raw, &servers); err != nil {
 			return "", nil, fmt.Errorf("decode %s failed: %w", KindServerList, err)
 		}
@@ -584,7 +598,7 @@ func parseServerList(raw json.RawMessage) (string, []serverSpec, error) {
 	}
 
 	var wrapped struct {
-		Servers []serverSpec `json:"servers"`
+		Servers []parsedServerSpec `json:"servers"`
 	}
 	if err := json.Unmarshal(raw, &wrapped); err != nil {
 		return "", nil, fmt.Errorf("decode %s failed: %w", KindServerList, err)
@@ -594,7 +608,7 @@ func parseServerList(raw json.RawMessage) (string, []serverSpec, error) {
 }
 
 func parseSingleServer(raw []byte) (string, []serverSpec, error) {
-	var spec serverSpec
+	var spec parsedServerSpec
 	if err := json.Unmarshal(raw, &spec); err != nil {
 		return "", nil, fmt.Errorf("decode %s failed: %w", KindSingleServer, err)
 	}
@@ -603,10 +617,17 @@ func parseSingleServer(raw []byte) (string, []serverSpec, error) {
 		spec.Name = defaultServerLabel
 	}
 
-	return KindSingleServer, []serverSpec{spec}, nil
+	return KindSingleServer, []serverSpec{{
+		Name:      spec.Name,
+		Command:   spec.Command,
+		Args:      spec.Args,
+		Cwd:       spec.Cwd,
+		Transport: spec.Transport,
+		URL:       spec.URL,
+	}}, nil
 }
 
-func normalizeServerList(servers []serverSpec) (string, []serverSpec, error) {
+func normalizeServerList(servers []parsedServerSpec) (string, []serverSpec, error) {
 	normalized := make([]serverSpec, 0, len(servers))
 	seen := make(map[string]struct{}, len(servers))
 	for i := range servers {
@@ -619,8 +640,14 @@ func normalizeServerList(servers []serverSpec) (string, []serverSpec, error) {
 			return "", nil, fmt.Errorf("duplicate server name detected: %s", name)
 		}
 		seen[name] = struct{}{}
-		spec.Name = name
-		normalized = append(normalized, spec)
+		normalized = append(normalized, serverSpec{
+			Name:      name,
+			Command:   spec.Command,
+			Args:      spec.Args,
+			Cwd:       spec.Cwd,
+			Transport: spec.Transport,
+			URL:       spec.URL,
+		})
 	}
 
 	return KindServerList, normalized, nil
