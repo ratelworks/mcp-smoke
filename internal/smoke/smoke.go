@@ -122,12 +122,12 @@ type configProbe struct {
 }
 
 type quickServerProbe struct {
-	Command   string
-	ArgsFirst string
+	Command     string
+	ArgsFirst   string
 	ArgsPresent bool
-	Cwd       string
-	Transport string
-	URL       string
+	Cwd         string
+	Transport   string
+	URL         string
 }
 
 type analysisCacheKey struct {
@@ -407,7 +407,10 @@ func parseFastServer(content []byte, i int) (quickServerProbe, int, bool) {
 			if !ok {
 				return spec, 0, false
 			}
-			spec.Command = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			spec.Command, ok = decodeJSONStringStrict(content[valueStart:valueEnd], valueEscaped)
+			if !ok {
+				return spec, 0, false
+			}
 			i = next
 		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "args"):
 			firstArg, hasArgs, next, ok := parseFastArgs(content, i)
@@ -422,21 +425,30 @@ func parseFastServer(content []byte, i int) (quickServerProbe, int, bool) {
 			if !ok {
 				return spec, 0, false
 			}
-			spec.Cwd = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			spec.Cwd, ok = decodeJSONStringStrict(content[valueStart:valueEnd], valueEscaped)
+			if !ok {
+				return spec, 0, false
+			}
 			i = next
 		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "transport"):
 			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
 			if !ok {
 				return spec, 0, false
 			}
-			spec.Transport = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			spec.Transport, ok = decodeJSONStringStrict(content[valueStart:valueEnd], valueEscaped)
+			if !ok {
+				return spec, 0, false
+			}
 			i = next
 		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "url"):
 			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
 			if !ok {
 				return spec, 0, false
 			}
-			spec.URL = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			spec.URL, ok = decodeJSONStringStrict(content[valueStart:valueEnd], valueEscaped)
+			if !ok {
+				return spec, 0, false
+			}
 			i = next
 		default:
 			i, ok = skipJSONValue(content, i)
@@ -482,7 +494,11 @@ func parseFastArgs(content []byte, i int) (string, bool, int, bool) {
 			return "", false, 0, false
 		}
 		if !hasArgs {
-			firstArg = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			decoded, decodeOK := decodeJSONStringStrict(content[valueStart:valueEnd], valueEscaped)
+			if !decodeOK {
+				return "", false, 0, false
+			}
+			firstArg = decoded
 			hasArgs = true
 		}
 		i = skipSpaces(content, next)
@@ -986,6 +1002,21 @@ func decodeJSONString(raw []byte, escaped bool) string {
 		return ""
 	}
 	return decoded
+}
+
+func decodeJSONStringStrict(raw []byte, escaped bool) (string, bool) {
+	if len(raw) == 0 {
+		return "", true
+	}
+	if !escaped {
+		return string(raw), true
+	}
+
+	decoded, err := strconv.Unquote(`"` + string(raw) + `"`)
+	if err != nil {
+		return "", false
+	}
+	return decoded, true
 }
 
 func equalJSONString(raw []byte, escaped bool, want string) bool {
