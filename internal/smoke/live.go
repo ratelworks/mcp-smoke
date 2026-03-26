@@ -125,9 +125,9 @@ func LiveCheck(spec serverSpec, baseDir string) []Finding {
 	defer func() {
 		stdin.Close()
 		if cmd.Process != nil {
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
-		cmd.Wait()
+		_ = cmd.Wait()
 	}()
 
 	var findings []Finding
@@ -203,7 +203,7 @@ func LiveCheck(spec serverSpec, baseDir string) []Finding {
 		Method:  "notifications/initialized",
 		Params:  map[string]interface{}{},
 	}
-	writeMessage(stdin, notif)
+	_ = writeMessage(stdin, notif)
 
 	// Step 2: Send tools/list
 	toolsReq := jsonrpcRequest{
