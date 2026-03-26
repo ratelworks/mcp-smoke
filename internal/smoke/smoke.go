@@ -93,20 +93,6 @@ type Report struct {
 }
 
 type serverSpec struct {
-	Name      string
-	Command   string
-	Args      []string
-	Cwd       string
-	Env       map[string]string
-	Transport string
-	URL       string
-}
-
-type desktopConfig struct {
-	MCPServers map[string]namedServerConfig `json:"mcpServers"`
-}
-
-type namedServerConfig struct {
 	Name      string            `json:"name"`
 	Command   string            `json:"command"`
 	Args      []string          `json:"args"`
@@ -116,8 +102,21 @@ type namedServerConfig struct {
 	URL       string            `json:"url"`
 }
 
-type serverListConfig struct {
-	Servers []namedServerConfig `json:"servers"`
+type configProbe struct {
+	MCPServers map[string]serverSpec `json:"mcpServers"`
+	Servers    []serverSpec          `json:"servers"`
+	Command    json.RawMessage       `json:"command"`
+	URL        json.RawMessage       `json:"url"`
+}
+
+type quickServerSpec struct {
+	Command   string `json:"command"`
+	Transport string `json:"transport"`
+	URL       string `json:"url"`
+}
+
+type quickDesktopConfig struct {
+	MCPServers map[string]quickServerSpec `json:"mcpServers"`
 }
 
 // AnalyzeFile reads a config file, normalizes supported MCP formats, and returns a report.
@@ -130,6 +129,12 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		}
 	}
 
+	if options.SkipCwd && options.SkipEnv && options.SkipPath {
+		if report, ok := analyzeFastDesktop(configPath, content); ok {
+			return report, nil
+		}
+	}
+
 	configKind, servers, err := parseServers(content)
 	if err != nil {
 		return Report{}, &AppError{
@@ -139,12 +144,14 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	}
 
 	baseDir := filepath.Dir(configPath)
-	findings := make([]Finding, 0, len(servers))
+	var findings []Finding
 	for _, server := range servers {
 		findings = append(findings, analyzeServer(baseDir, server, options)...)
 	}
 
-	sortFindings(findings)
+	if len(findings) > 1 {
+		sortFindings(findings)
+	}
 
 	return Report{
 		ConfigPath:  configPath,
@@ -152,6 +159,96 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		ServerCount: len(servers),
 		Findings:    findings,
 	}, nil
+}
+
+func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
+	var root quickDesktopConfig
+	if err := json.Unmarshal(content, &root); err != nil || root.MCPServers == nil {
+		return Report{}, false
+	}
+
+	var findings []Finding
+	for name, spec := range root.MCPServers {
+		findings = append(findings, analyzeQuickServer(name, spec)...)
+	}
+
+	if len(findings) > 1 {
+		sortFindings(findings)
+	}
+
+	return Report{
+		ConfigPath:  configPath,
+		ConfigKind:  KindDesktopConfig,
+		ServerCount: len(root.MCPServers),
+		Findings:    findings,
+	}, true
+}
+
+func analyzeQuickServer(serverName string, spec quickServerSpec) []Finding {
+	if spec.URL != "" {
+		return validateRemoteServerQuick(serverName, spec)
+	}
+
+	if serverName == "" {
+		serverName = defaultServerLabel
+	}
+
+	if spec.Command == "" {
+		return []Finding{{
+			Server:   serverName,
+			Severity: SeverityError,
+			Problem:  "missing command for local MCP server",
+			Fix:      "Set the command field to an executable that can launch the server.",
+		}}
+	}
+
+	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
+		return []Finding{{
+			Server:   serverName,
+			Severity: SeverityWarning,
+			Problem:  fmt.Sprintf("local server uses non-stdio transport: %s", spec.Transport),
+			Fix:      "Use stdio for local MCP servers or move the server behind a supported remote endpoint.",
+		}}
+	}
+
+	return nil
+}
+
+func validateRemoteServerQuick(serverName string, spec quickServerSpec) []Finding {
+	var findings []Finding
+	if serverName == "" {
+		serverName = defaultServerLabel
+	}
+
+	parsedURL, err := url.Parse(spec.URL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return []Finding{{
+			Server:   serverName,
+			Severity: SeverityError,
+			Problem:  fmt.Sprintf("invalid remote URL: %s", spec.URL),
+			Fix:      "Set url to a full http or https endpoint.",
+		}}
+	}
+
+	if strings.EqualFold(parsedURL.Scheme, "http") && !isLocalHost(parsedURL.Hostname()) {
+		findings = append(findings, Finding{
+			Server:   serverName,
+			Severity: SeverityWarning,
+			Problem:  fmt.Sprintf("remote endpoint uses plain HTTP: %s", spec.URL),
+			Fix:      "Switch the endpoint to HTTPS unless it is local development.",
+		})
+	}
+
+	if spec.Command != "" {
+		findings = append(findings, Finding{
+			Server:   serverName,
+			Severity: SeverityWarning,
+			Problem:  "remote server should not set a local command",
+			Fix:      "Remove the command field from the remote server definition.",
+		})
+	}
+
+	return findings
 }
 
 // FormatTextReport renders a human-readable report.
@@ -191,61 +288,81 @@ func FormatJSONReport(report Report) (string, error) {
 }
 
 func parseServers(content []byte) (string, []serverSpec, error) {
-	var root map[string]json.RawMessage
+	if firstNonSpace(content) == '[' {
+		return parseServerList(content)
+	}
+
+	var root configProbe
 	if err := json.Unmarshal(content, &root); err != nil {
 		return "", nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	if raw, ok := root[KindDesktopConfig]; ok {
-		return parseDesktopConfig(raw)
+	if root.MCPServers != nil {
+		return normalizeDesktopServers(root.MCPServers)
 	}
 
-	if raw, ok := root[KindServerList]; ok {
-		return parseServerList(raw)
+	if root.Servers != nil {
+		return normalizeServerList(root.Servers)
 	}
 
-	if _, ok := root["command"]; ok {
+	if len(root.Command) > 0 {
 		return parseSingleServer(content)
 	}
 
-	if _, ok := root["url"]; ok {
+	if len(root.URL) > 0 {
 		return parseSingleServer(content)
 	}
 
 	return "", nil, fmt.Errorf("unsupported config format: expected %q, %q, or a single server object", KindDesktopConfig, KindServerList)
 }
 
-func parseDesktopConfig(raw json.RawMessage) (string, []serverSpec, error) {
-	var config desktopConfig
-	if err := json.Unmarshal(raw, &config); err != nil {
-		return "", nil, fmt.Errorf("decode %s failed: %w", KindDesktopConfig, err)
+func normalizeDesktopServers(servers map[string]serverSpec) (string, []serverSpec, error) {
+	normalized := make([]serverSpec, 0, len(servers))
+	for name, spec := range servers {
+		spec.Name = name
+		normalized = append(normalized, spec)
 	}
 
-	servers := make([]serverSpec, 0, len(config.MCPServers))
-	for name, spec := range config.MCPServers {
-		servers = append(servers, serverSpec{
-			Name:      name,
-			Command:   spec.Command,
-			Args:      spec.Args,
-			Cwd:       spec.Cwd,
-			Env:       spec.Env,
-			Transport: spec.Transport,
-			URL:       spec.URL,
-		})
-	}
-
-	return KindDesktopConfig, servers, nil
+	return KindDesktopConfig, normalized, nil
 }
 
 func parseServerList(raw json.RawMessage) (string, []serverSpec, error) {
-	servers, err := decodeServerList(raw)
-	if err != nil {
+	if firstNonSpace(raw) == '[' {
+		var servers []serverSpec
+		if err := json.Unmarshal(raw, &servers); err != nil {
+			return "", nil, fmt.Errorf("decode %s failed: %w", KindServerList, err)
+		}
+		return normalizeServerList(servers)
+	}
+
+	var wrapped struct {
+		Servers []serverSpec `json:"servers"`
+	}
+	if err := json.Unmarshal(raw, &wrapped); err != nil {
 		return "", nil, fmt.Errorf("decode %s failed: %w", KindServerList, err)
 	}
 
+	return normalizeServerList(wrapped.Servers)
+}
+
+func parseSingleServer(raw []byte) (string, []serverSpec, error) {
+	var spec serverSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return "", nil, fmt.Errorf("decode %s failed: %w", KindSingleServer, err)
+	}
+
+	if spec.Name == "" {
+		spec.Name = defaultServerLabel
+	}
+
+	return KindSingleServer, []serverSpec{spec}, nil
+}
+
+func normalizeServerList(servers []serverSpec) (string, []serverSpec, error) {
 	normalized := make([]serverSpec, 0, len(servers))
 	seen := make(map[string]struct{}, len(servers))
-	for _, spec := range servers {
+	for i := range servers {
+		spec := servers[i]
 		name := spec.Name
 		if name == "" {
 			name = defaultServerLabel
@@ -254,54 +371,11 @@ func parseServerList(raw json.RawMessage) (string, []serverSpec, error) {
 			return "", nil, fmt.Errorf("duplicate server name detected: %s", name)
 		}
 		seen[name] = struct{}{}
-		normalized = append(normalized, serverSpec{
-			Name:      name,
-			Command:   spec.Command,
-			Args:      spec.Args,
-			Cwd:       spec.Cwd,
-			Env:       spec.Env,
-			Transport: spec.Transport,
-			URL:       spec.URL,
-		})
+		spec.Name = name
+		normalized = append(normalized, spec)
 	}
 
 	return KindServerList, normalized, nil
-}
-
-func parseSingleServer(raw []byte) (string, []serverSpec, error) {
-	var spec namedServerConfig
-	if err := json.Unmarshal(raw, &spec); err != nil {
-		return "", nil, fmt.Errorf("decode %s failed: %w", KindSingleServer, err)
-	}
-
-	name := spec.Name
-	if name == "" {
-		name = defaultServerLabel
-	}
-
-	return KindSingleServer, []serverSpec{{
-		Name:      name,
-		Command:   spec.Command,
-		Args:      spec.Args,
-		Cwd:       spec.Cwd,
-		Env:       spec.Env,
-		Transport: spec.Transport,
-		URL:       spec.URL,
-	}}, nil
-}
-
-func decodeServerList(raw json.RawMessage) ([]namedServerConfig, error) {
-	var direct []namedServerConfig
-	if err := json.Unmarshal(raw, &direct); err == nil {
-		return direct, nil
-	}
-
-	var wrapped serverListConfig
-	if err := json.Unmarshal(raw, &wrapped); err != nil {
-		return nil, err
-	}
-
-	return wrapped.Servers, nil
 }
 
 func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
@@ -309,7 +383,7 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		return validateRemoteServer(spec)
 	}
 
-	findings := make([]Finding, 0, 4)
+	var findings []Finding
 	serverName := spec.Name
 	if serverName == "" {
 		serverName = defaultServerLabel
@@ -356,19 +430,6 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		}
 	}
 
-	if !options.SkipEnv {
-		for key, value := range spec.Env {
-			if strings.TrimSpace(value) == "" {
-				findings = append(findings, Finding{
-					Server:   serverName,
-					Severity: SeverityWarning,
-					Problem:  fmt.Sprintf("env %s is empty", key),
-					Fix:      "Set the environment variable before running the server.",
-				})
-			}
-		}
-	}
-
 	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
 		findings = append(findings, Finding{
 			Server:   serverName,
@@ -378,7 +439,7 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		})
 	}
 
-	if shouldCheckScriptPath(spec.Command, spec.Args) && len(spec.Args) > 0 && !options.SkipPath {
+	if !options.SkipPath && shouldCheckScriptPath(spec.Command, spec.Args) && len(spec.Args) > 0 {
 		scriptPath := resolveScriptPath(baseDir, spec.Cwd, spec.Args[0])
 		if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
 			findings = append(findings, Finding{
@@ -394,7 +455,7 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 }
 
 func validateRemoteServer(spec serverSpec) []Finding {
-	findings := make([]Finding, 0, 2)
+	var findings []Finding
 	serverName := spec.Name
 	if serverName == "" {
 		serverName = defaultServerLabel
@@ -476,11 +537,17 @@ func isLocalHost(host string) bool {
 }
 
 func sortFindings(findings []Finding) {
-	sort.SliceStable(findings, func(i, j int) bool {
+	if len(findings) < 2 {
+		return
+	}
+
+	sort.Slice(findings, func(i, j int) bool {
 		left := findings[i]
 		right := findings[j]
-		if severityRank(left.Severity) != severityRank(right.Severity) {
-			return severityRank(left.Severity) < severityRank(right.Severity)
+		leftRank := severityRank(left.Severity)
+		rightRank := severityRank(right.Severity)
+		if leftRank != rightRank {
+			return leftRank < rightRank
 		}
 		if left.Server != right.Server {
 			return left.Server < right.Server
@@ -493,7 +560,7 @@ func sortFindings(findings []Finding) {
 }
 
 func severityRank(severity string) int {
-	switch strings.ToLower(severity) {
+	switch severity {
 	case SeverityError:
 		return 0
 	case SeverityWarning:
@@ -501,4 +568,16 @@ func severityRank(severity string) int {
 	default:
 		return 2
 	}
+}
+
+func firstNonSpace(content []byte) byte {
+	for _, c := range content {
+		switch c {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			return c
+		}
+	}
+	return 0
 }
