@@ -4,17 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 
 	"github.com/ratelworks/mcp-smoke/internal/smoke"
+	"github.com/spf13/cobra"
 )
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	if err := newRootCmd().Execute(); err != nil {
+		os.Exit(exitCode(err))
+	}
 }
 
-func run(args []string) int {
+func newRootCmd() *cobra.Command {
 	var configPath string
 	var jsonOutput bool
 	var skipCwd bool
@@ -22,160 +23,64 @@ func run(args []string) int {
 	var skipPath bool
 	var liveMode bool
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			if i+1 < len(args) {
-				if _, err := os.Stderr.WriteString("unexpected argument: " + args[i+1] + "\n"); err != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
+	cmd := &cobra.Command{
+		Use:     "mcp-smoke",
+		Short:   "Smoke test MCP client configs for common failures.",
+		Long:    "mcp-smoke reads a client config from disk, checks each MCP server definition, and reports concrete fixes for missing files, missing commands, and unsafe remote endpoints.",
+		Version: "0.2.0",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if configPath == "" {
+				return fmt.Errorf("--config is required")
 			}
-			break
-		}
 
-		if !strings.HasPrefix(arg, "-") || arg == "-" {
-			if _, err := os.Stderr.WriteString("unexpected argument: " + arg + "\n"); err != nil {
-				return smoke.ExitCodeSystemError
-			}
-			return smoke.ExitCodeUserError
-		}
-
-		key, value, hasValue := strings.Cut(arg, "=")
-		switch key {
-		case "-config", "--config":
-			if hasValue {
-				configPath = value
-				continue
-			}
-			if i+1 >= len(args) {
-				if _, err := os.Stderr.WriteString("flag needs an argument: -config\n"); err != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
-			}
-			i++
-			configPath = args[i]
-		case "-json", "--json":
-			valueBool, err := parseBoolFlag(hasValue, value)
+			report, err := smoke.AnalyzeFile(configPath, smoke.Options{
+				SkipCwd:  skipCwd,
+				SkipEnv:  skipEnv,
+				SkipPath: skipPath,
+				Live:     liveMode,
+			})
 			if err != nil {
-				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-					return smoke.ExitCodeSystemError
+				return err
+			}
+
+			var output string
+			if jsonOutput {
+				output, err = smoke.FormatJSONReport(report)
+				if err != nil {
+					return fmt.Errorf("render report failed: %w", err)
 				}
-				return smoke.ExitCodeUserError
+			} else {
+				output = smoke.FormatTextReport(report)
 			}
-			jsonOutput = valueBool
-		case "-skip-cwd", "--skip-cwd":
-			valueBool, err := parseBoolFlag(hasValue, value)
-			if err != nil {
-				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
+
+			fmt.Print(output)
+
+			if len(report.Findings) > 0 {
+				return fmt.Errorf("smoke check failed with %d finding(s)", len(report.Findings))
 			}
-			skipCwd = valueBool
-		case "-skip-env", "--skip-env":
-			valueBool, err := parseBoolFlag(hasValue, value)
-			if err != nil {
-				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
-			}
-			skipEnv = valueBool
-		case "-skip-path", "--skip-path":
-			valueBool, err := parseBoolFlag(hasValue, value)
-			if err != nil {
-				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
-			}
-			skipPath = valueBool
-		case "-live", "--live":
-			valueBool, err := parseBoolFlag(hasValue, value)
-			if err != nil {
-				if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-					return smoke.ExitCodeSystemError
-				}
-				return smoke.ExitCodeUserError
-			}
-			liveMode = valueBool
-		default:
-			if _, err := os.Stderr.WriteString("flag provided but not defined: " + arg + "\n"); err != nil {
-				return smoke.ExitCodeSystemError
-			}
-			return smoke.ExitCodeUserError
-		}
+			return nil
+		},
 	}
 
-	if configPath == "" {
-		if _, err := os.Stderr.WriteString("config path is required\n"); err != nil {
-			return smoke.ExitCodeSystemError
-		}
-		return smoke.ExitCodeUserError
-	}
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to an MCP client config file (required)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Print the report as JSON")
+	cmd.Flags().BoolVar(&skipCwd, "skip-cwd", false, "Skip working directory checks")
+	cmd.Flags().BoolVar(&skipEnv, "skip-env", false, "Skip environment variable checks")
+	cmd.Flags().BoolVar(&skipPath, "skip-path", false, "Skip command and script path checks")
+	cmd.Flags().BoolVar(&liveMode, "live", false, "Start each stdio server and verify MCP handshake")
 
-	report, err := smoke.AnalyzeFile(configPath, smoke.Options{
-		SkipCwd:  skipCwd,
-		SkipEnv:  skipEnv,
-		SkipPath: skipPath,
-		Live:     liveMode,
-	})
-	if err != nil {
-		if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-			return smoke.ExitCodeSystemError
-		}
-
-		var appErr *smoke.AppError
-		if errors.As(err, &appErr) {
-			if appErr.Kind == smoke.ErrorKindUser {
-				return smoke.ExitCodeUserError
-			}
-			return smoke.ExitCodeSystemError
-		}
-
-		return smoke.ExitCodeUserError
-	}
-
-	var output string
-	if jsonOutput {
-		output, err = smoke.FormatJSONReport(report)
-	} else {
-		output = smoke.FormatTextReport(report)
-	}
-	if err != nil {
-		if _, writeErr := os.Stderr.WriteString(err.Error() + "\n"); writeErr != nil {
-			return smoke.ExitCodeSystemError
-		}
-		return smoke.ExitCodeSystemError
-	}
-
-	if _, err := os.Stdout.WriteString(output); err != nil {
-		if _, writeErr := os.Stderr.WriteString("write report failed: " + err.Error() + "\n"); writeErr != nil {
-			return smoke.ExitCodeSystemError
-		}
-		return smoke.ExitCodeSystemError
-	}
-
-	if len(report.Findings) > 0 {
-		if _, err := os.Stderr.WriteString("smoke check failed with " + strconv.Itoa(len(report.Findings)) + " finding(s)\n"); err != nil {
-			return smoke.ExitCodeSystemError
-		}
-		return smoke.ExitCodeUserError
-	}
-
-	return smoke.ExitCodeSuccess
+	return cmd
 }
 
-func parseBoolFlag(hasValue bool, value string) (bool, error) {
-	if !hasValue {
-		return true, nil
+func exitCode(err error) int {
+	var appErr *smoke.AppError
+	if errors.As(err, &appErr) {
+		if appErr.Kind == smoke.ErrorKindUser {
+			return smoke.ExitCodeUserError
+		}
+		return smoke.ExitCodeSystemError
 	}
-
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("invalid boolean value %q", value)
-	}
-	return parsed, nil
+	return smoke.ExitCodeUserError
 }
