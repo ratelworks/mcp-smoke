@@ -110,14 +110,10 @@ type configProbe struct {
 	URL        json.RawMessage       `json:"url"`
 }
 
-type quickServerSpec struct {
-	Command   string `json:"command"`
-	Transport string `json:"transport"`
-	URL       string `json:"url"`
-}
-
-type quickDesktopConfig struct {
-	MCPServers map[string]quickServerSpec `json:"mcpServers"`
+type quickServerProbe struct {
+	CommandPresent bool
+	Transport      string
+	URL            string
 }
 
 // AnalyzeFile reads a config file, normalizes supported MCP formats, and returns a report.
@@ -163,14 +159,9 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 }
 
 func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
-	var root quickDesktopConfig
-	if err := json.Unmarshal(content, &root); err != nil || root.MCPServers == nil {
+	serverCount, findings, ok := parseFastDesktop(content)
+	if !ok {
 		return Report{}, false
-	}
-
-	findings := make([]Finding, 0, len(root.MCPServers))
-	for name, spec := range root.MCPServers {
-		findings = append(findings, analyzeQuickServer(name, spec)...)
 	}
 
 	if len(findings) > 1 {
@@ -180,23 +171,207 @@ func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
 	return Report{
 		ConfigPath:  configPath,
 		ConfigKind:  KindDesktopConfig,
-		ServerCount: len(root.MCPServers),
+		ServerCount: serverCount,
 		Findings:    findings,
 	}, true
 }
 
-func analyzeQuickServer(serverName string, spec quickServerSpec) []Finding {
+func parseFastDesktop(content []byte) (int, []Finding, bool) {
+	i := skipSpaces(content, 0)
+	if i >= len(content) || content[i] != '{' {
+		return 0, nil, false
+	}
+	i++
+
+	found := false
+	var serverCount int
+	var findings []Finding
+
+	for {
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return 0, nil, false
+		}
+		if content[i] == '}' {
+			if !found {
+				return 0, nil, false
+			}
+			return serverCount, findings, true
+		}
+
+		keyStart, keyEnd, next, keyEscaped, ok := scanJSONString(content, i)
+		if !ok {
+			return 0, nil, false
+		}
+		i = skipSpaces(content, next)
+		if i >= len(content) || content[i] != ':' {
+			return 0, nil, false
+		}
+		i = skipSpaces(content, i+1)
+
+		if equalJSONString(content[keyStart:keyEnd], keyEscaped, KindDesktopConfig) {
+			if i >= len(content) || content[i] != '{' {
+				return 0, nil, false
+			}
+			serverCount, findings, i, ok = parseFastDesktopServers(content, i, findings)
+			if !ok {
+				return 0, nil, false
+			}
+			found = true
+		} else {
+			i, ok = skipJSONValue(content, i)
+			if !ok {
+				return 0, nil, false
+			}
+		}
+
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return 0, nil, false
+		}
+		if content[i] == ',' {
+			i++
+			continue
+		}
+		if content[i] == '}' {
+			if !found {
+				return 0, nil, false
+			}
+			return serverCount, findings, true
+		}
+		return 0, nil, false
+	}
+}
+
+func parseFastDesktopServers(content []byte, i int, findings []Finding) (int, []Finding, int, bool) {
+	if content[i] != '{' {
+		return 0, nil, 0, false
+	}
+	i++
+
+	serverCount := 0
+	for {
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return 0, nil, 0, false
+		}
+		if content[i] == '}' {
+			return serverCount, findings, i + 1, true
+		}
+
+		nameStart, nameEnd, next, nameEscaped, ok := scanJSONString(content, i)
+		if !ok {
+			return 0, nil, 0, false
+		}
+		i = skipSpaces(content, next)
+		if i >= len(content) || content[i] != ':' {
+			return 0, nil, 0, false
+		}
+		i = skipSpaces(content, i+1)
+		if i >= len(content) || content[i] != '{' {
+			return 0, nil, 0, false
+		}
+
+		serverCount++
+		spec, next, ok := parseFastServer(content, i)
+		if !ok {
+			return 0, nil, 0, false
+		}
+		findings = append(findings, analyzeFastServer(content[nameStart:nameEnd], nameEscaped, spec)...)
+
+		i = skipSpaces(content, next)
+		if i >= len(content) {
+			return 0, nil, 0, false
+		}
+		if content[i] == ',' {
+			i++
+			continue
+		}
+		if content[i] == '}' {
+			return serverCount, findings, i + 1, true
+		}
+		return 0, nil, 0, false
+	}
+}
+
+func parseFastServer(content []byte, i int) (quickServerProbe, int, bool) {
+	var spec quickServerProbe
+	if content[i] != '{' {
+		return spec, 0, false
+	}
+	i++
+
+	for {
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return spec, 0, false
+		}
+		if content[i] == '}' {
+			return spec, i + 1, true
+		}
+
+		keyStart, keyEnd, next, keyEscaped, ok := scanJSONString(content, i)
+		if !ok {
+			return spec, 0, false
+		}
+		i = skipSpaces(content, next)
+		if i >= len(content) || content[i] != ':' {
+			return spec, 0, false
+		}
+		i = skipSpaces(content, i+1)
+
+		switch {
+		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "command"):
+			valueStart, valueEnd, next, _, ok := scanJSONString(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+			spec.CommandPresent = valueEnd > valueStart
+			i = next
+		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "transport"):
+			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+			spec.Transport = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			i = next
+		case equalJSONString(content[keyStart:keyEnd], keyEscaped, "url"):
+			valueStart, valueEnd, next, valueEscaped, ok := scanJSONString(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+			spec.URL = decodeJSONString(content[valueStart:valueEnd], valueEscaped)
+			i = next
+		default:
+			i, ok = skipJSONValue(content, i)
+			if !ok {
+				return spec, 0, false
+			}
+		}
+
+		i = skipSpaces(content, i)
+		if i >= len(content) {
+			return spec, 0, false
+		}
+		if content[i] == ',' {
+			i++
+			continue
+		}
+		if content[i] == '}' {
+			return spec, i + 1, true
+		}
+		return spec, 0, false
+	}
+}
+
+func analyzeFastServer(serverName []byte, serverNameEscaped bool, spec quickServerProbe) []Finding {
 	if spec.URL != "" {
-		return validateRemoteServerQuick(serverName, spec)
+		return validateRemoteServerQuick(serverName, serverNameEscaped, spec)
 	}
 
-	if serverName == "" {
-		serverName = defaultServerLabel
-	}
-
-	if spec.Command == "" {
+	if !spec.CommandPresent {
 		return []Finding{{
-			Server:   serverName,
+			Server:   serverNameText(serverName, serverNameEscaped),
 			Severity: SeverityError,
 			Problem:  "missing command for local MCP server",
 			Fix:      "Set the command field to an executable that can launch the server.",
@@ -205,7 +380,7 @@ func analyzeQuickServer(serverName string, spec quickServerSpec) []Finding {
 
 	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
 		return []Finding{{
-			Server:   serverName,
+			Server:   serverNameText(serverName, serverNameEscaped),
 			Severity: SeverityWarning,
 			Problem:  fmt.Sprintf("local server uses non-stdio transport: %s", spec.Transport),
 			Fix:      "Use stdio for local MCP servers or move the server behind a supported remote endpoint.",
@@ -215,34 +390,30 @@ func analyzeQuickServer(serverName string, spec quickServerSpec) []Finding {
 	return nil
 }
 
-func validateRemoteServerQuick(serverName string, spec quickServerSpec) []Finding {
-	findings := make([]Finding, 0, 2)
-	if serverName == "" {
-		serverName = defaultServerLabel
-	}
-
+func validateRemoteServerQuick(serverName []byte, serverNameEscaped bool, spec quickServerProbe) []Finding {
 	parsedURL, err := url.Parse(spec.URL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
 		return []Finding{{
-			Server:   serverName,
+			Server:   serverNameText(serverName, serverNameEscaped),
 			Severity: SeverityError,
 			Problem:  fmt.Sprintf("invalid remote URL: %s", spec.URL),
 			Fix:      "Set url to a full http or https endpoint.",
 		}}
 	}
 
+	findings := make([]Finding, 0, 2)
 	if strings.EqualFold(parsedURL.Scheme, "http") && !isLocalHost(parsedURL.Hostname()) {
 		findings = append(findings, Finding{
-			Server:   serverName,
+			Server:   serverNameText(serverName, serverNameEscaped),
 			Severity: SeverityWarning,
 			Problem:  fmt.Sprintf("remote endpoint uses plain HTTP: %s", spec.URL),
 			Fix:      "Switch the endpoint to HTTPS unless it is local development.",
 		})
 	}
 
-	if spec.Command != "" {
+	if spec.CommandPresent {
 		findings = append(findings, Finding{
-			Server:   serverName,
+			Server:   serverNameText(serverName, serverNameEscaped),
 			Severity: SeverityWarning,
 			Problem:  "remote server should not set a local command",
 			Fix:      "Remove the command field from the remote server definition.",
@@ -593,4 +764,194 @@ func firstNonSpace(content []byte) byte {
 		}
 	}
 	return 0
+}
+
+func decodeJSONString(raw []byte, escaped bool) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if !escaped {
+		return string(raw)
+	}
+
+	decoded, err := strconv.Unquote(`"` + string(raw) + `"`)
+	if err != nil {
+		return ""
+	}
+	return decoded
+}
+
+func equalJSONString(raw []byte, escaped bool, want string) bool {
+	if !escaped {
+		if len(raw) != len(want) {
+			return false
+		}
+		for i := range raw {
+			if raw[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	return decodeJSONString(raw, true) == want
+}
+
+func serverNameText(raw []byte, escaped bool) string {
+	if len(raw) == 0 {
+		return defaultServerLabel
+	}
+	if !escaped {
+		return string(raw)
+	}
+	return decodeJSONString(raw, true)
+}
+
+func skipJSONValue(content []byte, i int) (int, bool) {
+	i = skipSpaces(content, i)
+	if i >= len(content) {
+		return 0, false
+	}
+
+	switch content[i] {
+	case '"':
+		_, _, next, _, ok := scanJSONString(content, i)
+		return next, ok
+	case '{':
+		i++
+		for {
+			i = skipSpaces(content, i)
+			if i >= len(content) {
+				return 0, false
+			}
+			if content[i] == '}' {
+				return i + 1, true
+			}
+
+			_, _, next, _, ok := scanJSONString(content, i)
+			if !ok {
+				return 0, false
+			}
+			i = skipSpaces(content, next)
+			if i >= len(content) || content[i] != ':' {
+				return 0, false
+			}
+			i, ok = skipJSONValue(content, i+1)
+			if !ok {
+				return 0, false
+			}
+			i = skipSpaces(content, i)
+			if i >= len(content) {
+				return 0, false
+			}
+			if content[i] == ',' {
+				i++
+				continue
+			}
+			if content[i] == '}' {
+				return i + 1, true
+			}
+			return 0, false
+		}
+	case '[':
+		i++
+		for {
+			i = skipSpaces(content, i)
+			if i >= len(content) {
+				return 0, false
+			}
+			if content[i] == ']' {
+				return i + 1, true
+			}
+			var ok bool
+			i, ok = skipJSONValue(content, i)
+			if !ok {
+				return 0, false
+			}
+			i = skipSpaces(content, i)
+			if i >= len(content) {
+				return 0, false
+			}
+			if content[i] == ',' {
+				i++
+				continue
+			}
+			if content[i] == ']' {
+				return i + 1, true
+			}
+			return 0, false
+		}
+	default:
+		start := i
+		for i < len(content) {
+			switch content[i] {
+			case ',', '}', ']', ' ', '\n', '\r', '\t':
+				if i == start {
+					return 0, false
+				}
+				return i, true
+			default:
+				i++
+			}
+		}
+		if i == start {
+			return 0, false
+		}
+		return i, true
+	}
+}
+
+func scanJSONString(content []byte, i int) (start, end, next int, escaped, ok bool) {
+	if i >= len(content) || content[i] != '"' {
+		return 0, 0, 0, false, false
+	}
+
+	start = i + 1
+	for i++; i < len(content); i++ {
+		switch content[i] {
+		case '"':
+			return start, i, i + 1, escaped, true
+		case '\\':
+			escaped = true
+			i++
+			if i >= len(content) {
+				return 0, 0, 0, false, false
+			}
+			if content[i] == 'u' {
+				for j := 0; j < 4; j++ {
+					i++
+					if i >= len(content) || !isHexDigit(content[i]) {
+						return 0, 0, 0, false, false
+					}
+				}
+			}
+		}
+	}
+
+	return 0, 0, 0, false, false
+}
+
+func skipSpaces(content []byte, i int) int {
+	for i < len(content) {
+		switch content[i] {
+		case ' ', '\n', '\r', '\t':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func isHexDigit(c byte) bool {
+	switch {
+	case c >= '0' && c <= '9':
+		return true
+	case c >= 'a' && c <= 'f':
+		return true
+	case c >= 'A' && c <= 'F':
+		return true
+	default:
+		return false
+	}
 }
