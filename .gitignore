@@ -15,3 +15,10 @@ coverage.out
 
 # Dependency caches
 vendor/
+
+# AutoResearch (do not commit)
+results.tsv
+ar.json
+run.log
+program.md
+eval.sh
