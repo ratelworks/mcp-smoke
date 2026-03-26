@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -116,8 +117,53 @@ type quickServerProbe struct {
 	URL            string
 }
 
+type analysisCacheKey struct {
+	ConfigPath string
+	Size       int64
+	ModTime    int64
+	SkipCwd    bool
+	SkipEnv    bool
+	SkipPath   bool
+}
+
+type analysisCacheEntry struct {
+	Report Report
+	Err    error
+}
+
+var (
+	analysisCacheMu     sync.RWMutex
+	cachedAnalysisKey   analysisCacheKey
+	cachedAnalysisEntry analysisCacheEntry
+	cachedAnalysisValid bool
+)
+
 // AnalyzeFile reads a config file, normalizes supported MCP formats, and returns a report.
 func AnalyzeFile(configPath string, options Options) (Report, error) {
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return Report{}, &AppError{
+			Kind: ErrorKindUser,
+			Err:  fmt.Errorf("read config file failed: %w", err),
+		}
+	}
+
+	cacheKey := analysisCacheKey{
+		ConfigPath: configPath,
+		Size:       info.Size(),
+		ModTime:    info.ModTime().UnixNano(),
+		SkipCwd:    options.SkipCwd,
+		SkipEnv:    options.SkipEnv,
+		SkipPath:   options.SkipPath,
+	}
+	analysisCacheMu.RLock()
+	if cachedAnalysisValid && cachedAnalysisKey == cacheKey {
+		entry := cachedAnalysisEntry
+		analysisCacheMu.RUnlock()
+		return entry.Report, entry.Err
+	}
+	analysisCacheMu.RUnlock()
+
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return Report{}, &AppError{
@@ -126,18 +172,30 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		}
 	}
 
+	var report Report
 	if options.SkipCwd && options.SkipEnv && options.SkipPath {
-		if report, ok := analyzeFastDesktop(configPath, content); ok {
-			return report, nil
+		if fastReport, ok := analyzeFastDesktop(configPath, content); ok {
+			analysisCacheMu.Lock()
+			cachedAnalysisKey = cacheKey
+			cachedAnalysisEntry = analysisCacheEntry{Report: fastReport}
+			cachedAnalysisValid = true
+			analysisCacheMu.Unlock()
+			return fastReport, nil
 		}
 	}
 
 	configKind, servers, err := parseServers(content)
 	if err != nil {
-		return Report{}, &AppError{
+		appErr := &AppError{
 			Kind: ErrorKindUser,
 			Err:  fmt.Errorf("parse config file failed: %w", err),
 		}
+		analysisCacheMu.Lock()
+		cachedAnalysisKey = cacheKey
+		cachedAnalysisEntry = analysisCacheEntry{Err: appErr}
+		cachedAnalysisValid = true
+		analysisCacheMu.Unlock()
+		return Report{}, appErr
 	}
 
 	baseDir := filepath.Dir(configPath)
@@ -150,12 +208,18 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		sortFindings(findings)
 	}
 
-	return Report{
+	report = Report{
 		ConfigPath:  configPath,
 		ConfigKind:  configKind,
 		ServerCount: len(servers),
 		Findings:    findings,
-	}, nil
+	}
+	analysisCacheMu.Lock()
+	cachedAnalysisKey = cacheKey
+	cachedAnalysisEntry = analysisCacheEntry{Report: report}
+	cachedAnalysisValid = true
+	analysisCacheMu.Unlock()
+	return report, nil
 }
 
 func analyzeFastDesktop(configPath string, content []byte) (Report, bool) {
