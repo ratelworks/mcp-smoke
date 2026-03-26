@@ -24,10 +24,10 @@ func newRootCmd() *cobra.Command {
 	var liveMode bool
 
 	cmd := &cobra.Command{
-		Use:     "mcp-smoke",
-		Short:   "Smoke test MCP client configs for common failures.",
-		Long:    "mcp-smoke reads a client config from disk, checks each MCP server definition, and reports concrete fixes for missing files, missing commands, and unsafe remote endpoints.",
-		Version: "0.2.0",
+		Use:           "mcp-smoke",
+		Short:         "Smoke test MCP client configs for common failures.",
+		Long:          "mcp-smoke reads a client config from disk, checks each MCP server definition, and reports concrete fixes for missing files, missing commands, and unsafe remote endpoints.",
+		Version:       "0.2.0",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {

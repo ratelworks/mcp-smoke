@@ -136,6 +136,7 @@ type analysisCacheKey struct {
 	ModTime    int64
 	SkipCwd    bool
 	SkipPath   bool
+	Live       bool
 }
 
 type analysisCacheEntry struct {
@@ -166,6 +167,7 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 		ModTime:    info.ModTime().UnixNano(),
 		SkipCwd:    options.SkipCwd,
 		SkipPath:   options.SkipPath,
+		Live:       options.Live,
 	}
 	analysisCacheMu.RLock()
 	if cachedAnalysisValid && cachedAnalysisKey == cacheKey {
@@ -184,13 +186,15 @@ func AnalyzeFile(configPath string, options Options) (Report, error) {
 	}
 
 	var report Report
-	if fastReport, ok := analyzeFastDesktop(configPath, content, options); ok {
-		analysisCacheMu.Lock()
-		cachedAnalysisKey = cacheKey
-		cachedAnalysisEntry = analysisCacheEntry{Report: fastReport}
-		cachedAnalysisValid = true
-		analysisCacheMu.Unlock()
-		return fastReport, nil
+	if !options.Live {
+		if fastReport, ok := analyzeFastDesktop(configPath, content, options); ok {
+			analysisCacheMu.Lock()
+			cachedAnalysisKey = cacheKey
+			cachedAnalysisEntry = analysisCacheEntry{Report: fastReport}
+			cachedAnalysisValid = true
+			analysisCacheMu.Unlock()
+			return fastReport, nil
+		}
 	}
 
 	configKind, servers, err := parseServers(content)
@@ -521,10 +525,13 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 		return validateRemoteServerQuick(serverName, serverNameEscaped, spec)
 	}
 
-	findings := make([]Finding, 0, 4)
-	serverNameValue := serverNameText(serverName, serverNameEscaped)
+	var findings []Finding
+	serverNameValue := ""
 
 	if spec.Command == "" {
+		if serverNameValue == "" {
+			serverNameValue = serverNameText(serverName, serverNameEscaped)
+		}
 		return []Finding{{
 			Server:   serverNameValue,
 			Severity: SeverityError,
@@ -535,6 +542,9 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 
 	if !options.SkipPath {
 		if _, err := exec.LookPath(spec.Command); err != nil {
+			if serverNameValue == "" {
+				serverNameValue = serverNameText(serverName, serverNameEscaped)
+			}
 			findings = append(findings, Finding{
 				Server:   serverNameValue,
 				Severity: SeverityError,
@@ -548,6 +558,9 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 		cwdPath := resolvePath(baseDir, spec.Cwd)
 		info, err := os.Stat(cwdPath)
 		if err != nil {
+			if serverNameValue == "" {
+				serverNameValue = serverNameText(serverName, serverNameEscaped)
+			}
 			findings = append(findings, Finding{
 				Server:   serverNameValue,
 				Severity: SeverityError,
@@ -555,6 +568,9 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 				Fix:      "Create the directory or point cwd at an existing workspace.",
 			})
 		} else if !info.IsDir() {
+			if serverNameValue == "" {
+				serverNameValue = serverNameText(serverName, serverNameEscaped)
+			}
 			findings = append(findings, Finding{
 				Server:   serverNameValue,
 				Severity: SeverityError,
@@ -565,6 +581,9 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 	}
 
 	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
+		if serverNameValue == "" {
+			serverNameValue = serverNameText(serverName, serverNameEscaped)
+		}
 		findings = append(findings, Finding{
 			Server:   serverNameValue,
 			Severity: SeverityWarning,
@@ -576,6 +595,9 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 	if !options.SkipPath && spec.ArgsPresent && shouldCheckScriptPath(spec.Command, []string{spec.ArgsFirst}) {
 		scriptPath := resolveScriptPath(baseDir, spec.Cwd, spec.ArgsFirst)
 		if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+			if serverNameValue == "" {
+				serverNameValue = serverNameText(serverName, serverNameEscaped)
+			}
 			findings = append(findings, Finding{
 				Server:   serverNameValue,
 				Severity: SeverityError,
@@ -591,17 +613,21 @@ func analyzeFastServer(baseDir string, serverName []byte, serverNameEscaped bool
 func validateRemoteServerQuick(serverName []byte, serverNameEscaped bool, spec quickServerProbe) []Finding {
 	parsedURL, err := url.Parse(spec.URL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		serverNameValue := serverNameText(serverName, serverNameEscaped)
 		return []Finding{{
-			Server:   serverNameText(serverName, serverNameEscaped),
+			Server:   serverNameValue,
 			Severity: SeverityError,
 			Problem:  fmt.Sprintf("invalid remote URL: %s", spec.URL),
 			Fix:      "Set url to a full http or https endpoint.",
 		}}
 	}
 
-	findings := make([]Finding, 0, 2)
-	serverNameValue := serverNameText(serverName, serverNameEscaped)
+	var findings []Finding
+	serverNameValue := ""
 	if strings.EqualFold(parsedURL.Scheme, "http") && !isLocalHost(parsedURL.Hostname()) {
+		if serverNameValue == "" {
+			serverNameValue = serverNameText(serverName, serverNameEscaped)
+		}
 		findings = append(findings, Finding{
 			Server:   serverNameValue,
 			Severity: SeverityWarning,
@@ -611,6 +637,9 @@ func validateRemoteServerQuick(serverName []byte, serverNameEscaped bool, spec q
 	}
 
 	if spec.Command != "" {
+		if serverNameValue == "" {
+			serverNameValue = serverNameText(serverName, serverNameEscaped)
+		}
 		findings = append(findings, Finding{
 			Server:   serverNameValue,
 			Severity: SeverityWarning,
@@ -790,13 +819,16 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		return validateRemoteServer(spec)
 	}
 
-	findings := make([]Finding, 0, 4)
-	serverName := spec.Name
-	if serverName == "" {
-		serverName = defaultServerLabel
-	}
+	var findings []Finding
+	serverName := ""
 
 	if spec.Command == "" {
+		if serverName == "" {
+			serverName = spec.Name
+			if serverName == "" {
+				serverName = defaultServerLabel
+			}
+		}
 		findings = append(findings, Finding{
 			Server:   serverName,
 			Severity: SeverityError,
@@ -808,6 +840,12 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 
 	if !options.SkipPath {
 		if _, err := exec.LookPath(spec.Command); err != nil {
+			if serverName == "" {
+				serverName = spec.Name
+				if serverName == "" {
+					serverName = defaultServerLabel
+				}
+			}
 			findings = append(findings, Finding{
 				Server:   serverName,
 				Severity: SeverityError,
@@ -821,6 +859,12 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 		cwdPath := resolvePath(baseDir, spec.Cwd)
 		info, err := os.Stat(cwdPath)
 		if err != nil {
+			if serverName == "" {
+				serverName = spec.Name
+				if serverName == "" {
+					serverName = defaultServerLabel
+				}
+			}
 			findings = append(findings, Finding{
 				Server:   serverName,
 				Severity: SeverityError,
@@ -828,6 +872,12 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 				Fix:      "Create the directory or point cwd at an existing workspace.",
 			})
 		} else if !info.IsDir() {
+			if serverName == "" {
+				serverName = spec.Name
+				if serverName == "" {
+					serverName = defaultServerLabel
+				}
+			}
 			findings = append(findings, Finding{
 				Server:   serverName,
 				Severity: SeverityError,
@@ -838,6 +888,12 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 	}
 
 	if spec.Transport != "" && !strings.EqualFold(spec.Transport, "stdio") {
+		if serverName == "" {
+			serverName = spec.Name
+			if serverName == "" {
+				serverName = defaultServerLabel
+			}
+		}
 		findings = append(findings, Finding{
 			Server:   serverName,
 			Severity: SeverityWarning,
@@ -849,6 +905,12 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 	if !options.SkipPath && shouldCheckScriptPath(spec.Command, spec.Args) && len(spec.Args) > 0 {
 		scriptPath := resolveScriptPath(baseDir, spec.Cwd, spec.Args[0])
 		if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+			if serverName == "" {
+				serverName = spec.Name
+				if serverName == "" {
+					serverName = defaultServerLabel
+				}
+			}
 			findings = append(findings, Finding{
 				Server:   serverName,
 				Severity: SeverityError,
@@ -862,14 +924,17 @@ func analyzeServer(baseDir string, spec serverSpec, options Options) []Finding {
 }
 
 func validateRemoteServer(spec serverSpec) []Finding {
-	findings := make([]Finding, 0, 2)
-	serverName := spec.Name
-	if serverName == "" {
-		serverName = defaultServerLabel
-	}
+	var findings []Finding
+	serverName := ""
 
 	parsedURL, err := url.Parse(spec.URL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		if serverName == "" {
+			serverName = spec.Name
+			if serverName == "" {
+				serverName = defaultServerLabel
+			}
+		}
 		findings = append(findings, Finding{
 			Server:   serverName,
 			Severity: SeverityError,
@@ -880,6 +945,12 @@ func validateRemoteServer(spec serverSpec) []Finding {
 	}
 
 	if strings.EqualFold(parsedURL.Scheme, "http") && !isLocalHost(parsedURL.Hostname()) {
+		if serverName == "" {
+			serverName = spec.Name
+			if serverName == "" {
+				serverName = defaultServerLabel
+			}
+		}
 		findings = append(findings, Finding{
 			Server:   serverName,
 			Severity: SeverityWarning,
@@ -889,6 +960,12 @@ func validateRemoteServer(spec serverSpec) []Finding {
 	}
 
 	if spec.Command != "" {
+		if serverName == "" {
+			serverName = spec.Name
+			if serverName == "" {
+				serverName = defaultServerLabel
+			}
+		}
 		findings = append(findings, Finding{
 			Server:   serverName,
 			Severity: SeverityWarning,
