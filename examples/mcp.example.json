@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "definitely-missing-mcp-server",
+      "args": ["server.js"],
+      "cwd": "./missing-workspace",
+      "env": {
+        "API_KEY": "",
+        "REGION": "us-central1"
+      }
+    },
+    "preview": {
+      "url": "http://example.com/mcp"
+    }
+  }
+}
